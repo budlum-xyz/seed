@@ -1,0 +1,452 @@
+# Security Hardening, extra inspections
+#
+# Missing inspections:
+#   - cargo machete (unused dependencies)
+#   - cargo mutants (mutation testing)
+#   - cargo-supply-chain (publisher visibility)
+#   - ThreadSanitizer (data race detection)
+#   - RUSTFLAGS overflow-checks verification
+#
+# This workflow runs weekly (heavy/slow inspections).
+# It is not triggered on PRs - only schedule + workflow_dispatch.
+
+name: Security Hardening
+
+on:
+  schedule:
+    - cron: "30 5 * * 1"   # weekly, Monday 05:30 UTC
+  workflow_dispatch:
+
+concurrency:
+  group: security-hardening-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+permissions:
+  contents: read
+
+jobs:
+  machete:
+    name: cargo machete (unused deps)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master 2026-07-16
+        with:
+          toolchain: "1.97.1"
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: seed-core
+      # The version was unpinned. extra-tooling.yml pins the same tool to 0.8.0;
+      # the same version and the same sha256 are used here too, otherwise two
+      # workflows would run different tools under the same name.
+      - name: Install cargo-machete (version + sha256 pinned)
+        run: |
+          set -euo pipefail
+          curl -sSfL -o /tmp/machete.tar.gz \
+            https://github.com/bnjbvr/cargo-machete/releases/download/v0.8.0/cargo-machete-v0.8.0-x86_64-unknown-linux-musl.tar.gz
+          echo "020f6608f9be1562d1fb601e5808e541ccb8806e7e4dfde27d48bc22254a002c  /tmp/machete.tar.gz" | sha256sum -c -
+          tar -xzf /tmp/machete.tar.gz -C /tmp
+          install -m755 "$(find /tmp -name cargo-machete -type f | head -1)" /usr/local/bin/cargo-machete
+          cargo-machete --version
+      - name: cargo machete (root)
+        run: cargo machete --with-metadata || true
+
+  # BLOCKS. The previous form carried both `continue-on-error: true` and `|| true`,
+  # and the tool never ran at all:
+  #
+  #   error: unexpected argument '--test-timeout' found
+  #
+  # In cargo-mutants 27.1.0 the flag is `--timeout`. The command died within
+  # seconds on an argument error, `|| true` swallowed the exit code,
+  # `continue-on-error` covered the rest, and the job reported GREEN.
+  # A two-minute "mutation testing" job actually consisted of installing the
+  # tool. This is the most expensive form of softening: it hides not a gate
+  # failing, but a gate never running at all.
+  #
+  # What it measures is also what no other gate measures. Every other gate
+  # inspects what the code does; this inspects whether the tests NOTICE a
+  # change. A green test suite can also consist of tests that assert nothing.
+  #
+  mutants:
+    name: cargo mutants (mutation testing)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master 2026-07-16
+        with:
+          toolchain: "1.97.1"
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: seed-core
+      - name: cargo install cargo-mutants
+        run: cargo install cargo-mutants --locked
+      # Canary: a crate is written with a test that deliberately asserts nothing
+      # and cargo-mutants is expected to report a surviving mutant. If it does
+      # not, a clean report does not say "the tests are solid", at most "the tool
+      # did not run". This job stayed green for months in exactly that state, so
+      # the canary here is not a formality.
+      - name: mutants canary (does the tool really find survivors)
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/mutants-canary/src
+          cat > /tmp/mutants-canary/Cargo.toml <<'EOF'
+          [package]
+          name = "mutants-canary"
+          version = "0.0.0"
+          edition = "2021"
+          EOF
+          # The test calls the function and says nothing about the result.
+          # `cargo test` is green; it stays green however the body changes, which
+          # is exactly what mutation testing exists to find.
+          cat > /tmp/mutants-canary/src/lib.rs <<'EOF'
+          pub fn double(x: i32) -> i32 {
+              x * 2
+          }
+
+          #[cfg(test)]
+          mod tests {
+              #[test]
+              fn calls_it_and_asserts_nothing() {
+                  let _ = super::double(21);
+              }
+          }
+          EOF
+          cd /tmp/mutants-canary
+          cargo test --quiet
+          # Capture the output into a file first: under `set -euo pipefail`, if a
+          # program in a pipeline exits non-zero, grep never runs.
+          set +e
+          cargo mutants --in-place --timeout 60 > /tmp/mutants-canary.log 2>&1
+          status=$?
+          set -e
+          if [ "$status" -eq 0 ]; then
+            echo "CANARY FAILED: no surviving mutant was reported under a test that" >&2
+            echo "no surviving mutant was reported, so the tool either is not running or" >&2
+            echo "is not measuring anything." >&2
+            tail -30 /tmp/mutants-canary.log >&2
+            exit 1
+          fi
+          if grep -qi "MISSED\|missed" /tmp/mutants-canary.log; then
+            echo "canary OK: the tool found the mutant surviving under the empty test."
+          else
+            echo "CANARY FAILED: the tool failed but the reason is not a surviving mutant." >&2
+            tail -30 /tmp/mutants-canary.log >&2
+            exit 1
+          fi
+      # `--in-diff`: mutating the whole tree on every run takes hours and yields
+      # findings about code a PR did not change. This branch's diff is inspected,
+      # so the question becomes "is this change tested", which is the only
+      # answerable question.
+      #
+      # The branch name is not expanded into the shell with `${{ }}`. A branch
+      # name can contain almost anything and an expression expanding inside `run:`
+      # runs that text as a command: a branch name carrying `$(...)` executes code
+      # in this step. zizmor reported this as template-injection with high
+      # confidence and was right. The value passes through an environment variable
+      # and the shell reads it as quoted data.
+      - name: Extract the diff
+        env:
+          BASE_REF: ${{ github.base_ref || 'main' }}
+        run: |
+          set -euo pipefail
+          git diff "origin/${BASE_REF}..." > /tmp/pr.diff || git diff HEAD~1 > /tmp/pr.diff
+      - name: cargo mutants (code touched by this change)
+        run: cargo mutants --in-place --timeout 300 --in-diff /tmp/pr.diff -- --lib
+
+  supply-chain:
+    name: cargo-supply-chain (publisher visibility)
+    runs-on: ubuntu-latest
+    # Querying `publishers` one by one exceeded 15 minutes; `update` fetches in
+    # bulk so the time drops, but with a cold cache the first fetch takes long.
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master 2026-07-16
+        with:
+          toolchain: "1.97.1"
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: seed-core
+      - name: cargo install cargo-supply-chain
+        run: cargo install cargo-supply-chain --locked
+      # Every run of `publishers` asked crates.io per crate at more than about
+      # 2 seconds each, and with 566 dependencies that exceeded the 15-minute
+      # timeout: the job was cancelled and produced no output. `update` fetches
+      # the same data in one batch and later commands read from the cache.
+      - name: Fetch publisher data in bulk
+        run: cargo supply-chain update --cache-max-age 1w
+      - name: cargo supply-chain publishers
+        run: cargo supply-chain publishers
+      - name: cargo supply-chain crates
+        run: cargo supply-chain crates
+      # This job had no threshold, so it could not fail, and it carried `|| true`.
+      # The threshold is this: the tree must not reach a dependency with NO
+      # PUBLISHER. An ownerless crate on crates.io is one nobody can take over and
+      # nobody can patch; for a chain that is not a version lag but a hole that
+      # will never close.
+      #
+      # Existence is inspected, not a count: "how many publishers" is not a
+      # threshold because the right number is unknown. "Zero publishers" is always wrong.
+      - name: The ownerless dependency gate
+        run: |
+          set -euo pipefail
+          cargo supply-chain json --diffable > /tmp/supply-chain.json
+          python3 - <<'PY'
+          import json, sys
+
+          with open("/tmp/supply-chain.json") as f:
+              data = json.load(f)
+
+          # Crates with no owner: neither a user nor a team can publish them.
+          # Such a dependency cannot be patched.
+          orphans = []
+          for crate in data.get("crates_io_crates", []):
+              name = crate.get("name", "?")
+              owners = crate.get("owners", [])
+              if not owners:
+                  orphans.append(name)
+
+          total = len(data.get("crates_io_crates", []))
+          if total == 0:
+              print(
+                  "THE GATE RAN EMPTY: cargo-supply-chain reported no crates, "
+                  "so this check inspected nothing.",
+                  file=sys.stderr,
+              )
+              sys.exit(1)
+
+          if orphans:
+              print(f"{len(orphans)} ownerless dependencies:", file=sys.stderr)
+              for o in sorted(orphans):
+                  print(f"  {o}", file=sys.stderr)
+              print(
+                  "\nAn ownerless crate cannot be patched by anyone. If a vulnerability "
+                  "appears there is nobody to wait for; replace the dependency or "
+                  "vendor it in.",
+                  file=sys.stderr,
+              )
+              sys.exit(1)
+
+          print(f"No ownerless dependencies: all {total} crates.io crates have a publisher.")
+          PY
+
+  # BLOCKS. For a chain a data race is not a flaky test: if two nodes reach
+  # different states depending on the outcome of a race, that is a fork.
+  #
+  # The previous shape carried both `continue-on-error: true` and `|| true`, so
+  # so it could not fail under any condition, and it had no canary: "no data
+  # race" could not be told apart from "the binary never ran". Both were removed and a canary added.
+  tsan:
+    name: ThreadSanitizer (data race detection)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust (nightly for TSan)
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master 2026-07-16
+        with:
+          toolchain: nightly
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: seed-core
+      # Canary: a deliberately racing program is written and TSan is expected to
+      # catch it. If it does not, the tool is not working and a clean report says
+      # nothing. Without the canary a green job would say not that the scan ran,
+      # but at most that it did not fail.
+      - name: TSan canary (does the tool really catch it)
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/tsan-canary/src
+          cat > /tmp/tsan-canary/Cargo.toml <<'EOF'
+          [package]
+          name = "tsan-canary"
+          version = "0.0.0"
+          edition = "2021"
+          EOF
+          cat > /tmp/tsan-canary/src/main.rs <<'EOF'
+          // Two threads write to the same address without synchronization. If TSan
+          // does not see this the scan is not trustworthy.
+          fn main() {
+              let mut value = 0i64;
+              let ptr = std::ptr::addr_of_mut!(value) as usize;
+              let a = std::thread::spawn(move || {
+                  let p = ptr as *mut i64;
+                  for _ in 0..10_000 { unsafe { *p += 1 } }
+              });
+              let b = std::thread::spawn(move || {
+                  let p = ptr as *mut i64;
+                  for _ in 0..10_000 { unsafe { *p += 1 } }
+              });
+              a.join().unwrap();
+              b.join().unwrap();
+              println!("{value}");
+          }
+          EOF
+          cd /tmp/tsan-canary
+          export RUSTFLAGS="-Zsanitizer=thread"
+          if cargo +nightly run -Zbuild-std --target x86_64-unknown-linux-gnu 2>&1 \
+             | tee /tmp/tsan-canary.log | grep -q "WARNING: ThreadSanitizer"; then
+            echo "canary OK: TSan caught the deliberately written race."
+          else
+            echo "CANARY FAILED: TSan could not catch a data race, so even a clean report" >&2
+            echo "from this job proves nothing." >&2
+            tail -20 /tmp/tsan-canary.log >&2
+            exit 1
+          fi
+
+      - name: RUSTFLAGS -Zsanitizer=thread
+        run: |
+          set -euo pipefail
+          export RUSTFLAGS="-Zsanitizer=thread"
+          cargo +nightly test --lib --target x86_64-unknown-linux-gnu -- --test-threads=1
+
+  # BLOCKS. TSan reports the race it sees, loom proves the one it does not see.
+  #
+  # The two do not measure the same thing and neither replaces the other. TSan
+  # inspects the schedule the machine happened to pick, so a green run says "the
+  # schedules tried were clean". A lock inversion needs two threads arriving at
+  # the wrong moment in the wrong order, which is the schedule a loaded runner
+  # is least likely to produce.
+  #
+  # loom runs the model: EVERY interleaving the memory model allows, exhaustively.
+  # It detects deadlock not by waiting but as a state with no runnable thread
+  # left. When it passes, the ordering is proven for the model rather than
+  # observed once.
+  #
+  # PoSEngine holds four locks and three call sites take two of them at once:
+  # seen_blocks -> checkpoints -> slashing_evidence. What is proven is that this
+  # chain is acyclic.
+  loom:
+    name: loom (consensus lock order, exhaustive model)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master 2026-07-16
+        with:
+          toolchain: "1.97.1"
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: seed-core
+      # Canary: a model that deliberately takes locks in reverse order is written
+      # and loom is expected to find the deadlock. If it does not, the real tests
+      # being green would say not that the ordering is correct, but at most that
+      # loom did not run. When `--cfg loom` is forgotten the tests silently do not
+      # compile and nothing runs; the canary catches exactly that state.
+      - name: loom canary (does the tool really find the deadlock)
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/loom-canary/src
+          cat > /tmp/loom-canary/Cargo.toml <<'EOF'
+          [package]
+          name = "loom-canary"
+          version = "0.0.0"
+          edition = "2021"
+
+          [dependencies]
+          loom = "0.7"
+          EOF
+          cat > /tmp/loom-canary/src/main.rs <<'EOF'
+          // Two threads take the same two locks in REVERSE order. If loom does not
+          // find it, the real lock-order tests prove nothing.
+          use loom::sync::Mutex;
+          use loom::thread;
+          use std::sync::Arc;
+
+          fn main() {
+              loom::model(|| {
+                  let a = Arc::new(Mutex::new(0));
+                  let b = Arc::new(Mutex::new(0));
+
+                  let t1 = {
+                      let (a, b) = (Arc::clone(&a), Arc::clone(&b));
+                      thread::spawn(move || {
+                          let _x = a.lock().unwrap();
+                          let _y = b.lock().unwrap();
+                      })
+                  };
+                  let t2 = {
+                      let (a, b) = (Arc::clone(&a), Arc::clone(&b));
+                      thread::spawn(move || {
+                          let _y = b.lock().unwrap();
+                          let _x = a.lock().unwrap();
+                      })
+                  };
+                  t1.join().unwrap();
+                  t2.join().unwrap();
+              });
+          }
+          EOF
+          cd /tmp/loom-canary
+          # This command is EXPECTED TO FAIL: the model deadlocks.
+          # We capture the output into a file first, because under `set -euo pipefail`
+          # if a program in a pipeline exits non-zero grep never runs and the canary
+          # measures its own shell.
+          set +e
+          RUSTFLAGS="--cfg loom" cargo run --release > /tmp/loom-canary.log 2>&1
+          status=$?
+          set -e
+          if [ "$status" -eq 0 ]; then
+            echo "CANARY FAILED: loom did not report a deliberately inverted lock order" >&2
+            echo "as a deadlock, so the real tests are running empty." >&2
+            tail -30 /tmp/loom-canary.log >&2
+            exit 1
+          fi
+          if grep -qi "deadlock" /tmp/loom-canary.log; then
+            echo "canary OK: loom found the deliberately inverted ordering as a deadlock."
+          else
+            echo "CANARY FAILED: loom failed but the reason is not a deadlock." >&2
+            tail -30 /tmp/loom-canary.log >&2
+            exit 1
+          fi
+      # The model compiles against loom in a harness crate whose only dependency
+      # is loom itself. The previous form set `--cfg loom` through RUSTFLAGS on
+      # the whole `cargo test --lib` build, which recompiles every transitive
+      # dependency with the loom cfg; the smol-ecosystem crates in the tree
+      # (event-listener, event-listener-strategy, concurrent-queue, parking)
+      # gate their sync shims behind `#[cfg(loom)]` with a target-scoped
+      # optional `loom` dependency that cargo does not resolve from RUSTFLAGS,
+      # so the build broke with "cannot find module or crate `loom`" inside a
+      # dependency. The harness keeps the cfg scoped to the model, and the
+      # model file is the same file the normal test tree compiles (the
+      # inventory test inside it stays in the ordinary profile too), so the
+      # loom run cannot drift from what CI otherwise verifies.
+      - name: The loom model (every interleaving)
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/loom-model/src
+          cat > /tmp/loom-model/Cargo.toml <<'EOF'
+          [package]
+          name = "loom-model"
+          version = "0.0.0"
+          edition = "2021"
+
+          [dependencies]
+          loom = "0.7"
+          EOF
+          cat > /tmp/loom-model/src/main.rs <<EOF
+          //! Harness that compiles the real model file from the checkout, so the
+          //! loom run cannot drift from the file the ordinary test tree builds.
+          #[path = "$GITHUB_WORKSPACE/src/tests/consensus_lock_order_loom.rs"]
+          mod consensus_lock_order_loom;
+
+          fn main() {}
+          EOF
+          cd /tmp/loom-model
+          RUSTFLAGS="--cfg loom" cargo test --release -- --nocapture

@@ -1,0 +1,263 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+permissions:
+  contents: read
+
+jobs:
+  lint-fmt:
+    name: cargo fmt (must be clean)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master 2026-07-16
+        with:
+          toolchain: "1.97.1"
+          components: rustfmt
+      - name: cargo fmt --check
+        run: cargo fmt --all --check
+
+  clippy:
+    name: cargo clippy (warnings are errors)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master 2026-07-16
+        with:
+          toolchain: "1.97.1"
+          components: clippy
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: seed-core
+      - name: cargo clippy (all targets)
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+  test:
+    name: cargo test (${{ matrix.mode }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - mode: debug
+            flags: ""
+          - mode: release
+            flags: --release
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master 2026-07-16
+        with:
+          toolchain: "1.97.1"
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: seed-core
+      - name: cargo test --lib
+        # The golden-vector tests inside the library double as the
+        # determinism witness: they pin the wire bytes of every stage.
+        run: cargo test --lib --locked ${{ matrix.flags }}
+      - name: cargo test --examples
+        run: cargo test --examples --locked ${{ matrix.flags }}
+
+  web:
+    name: web (npm ci, build, test, audit)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: npm ci
+        run: npm ci
+      - name: npm test
+        run: npm test
+      - name: npm run build
+        run: npm run build
+      - name: npm audit (high or above)
+        run: npm audit --audit-level=high
+
+  fuzz-build:
+    name: fuzz targets compile (nightly)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust (nightly)
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master 2026-07-16
+        with:
+          toolchain: nightly
+      - name: Override the rust-toolchain.toml pin (nightly is required)
+        run: rustup override set nightly
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: fuzz
+          shared-key: fuzz
+      - name: Install cargo-fuzz
+        run: cargo install --locked cargo-fuzz
+      - name: cargo fuzz build (all targets)
+        working-directory: fuzz
+        run: cargo fuzz build
+
+  cargo-deny:
+    # Dependency advisories, bans, licences and sources in one combined gate.
+    name: Cargo Deny (root)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: cargo deny check (advisories, bans, licenses, sources)
+        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          manifest-path: ./Cargo.toml
+          arguments: --all-features --config .quality/deny.toml
+          command: check
+
+  license-compliance:
+    # Dependency licence compatibility, kept as its own job on purpose.
+    #
+    # `cargo-deny check` (the job above) already covers licences as one of its
+    # four sections, but a failure there surfaces as one red "Cargo Deny" check
+    # and the reason has to be dug out of the log. Licence compatibility is a
+    # legal-exposure question rather than a hygiene one, so it gets a check
+    # that says in its own name what broke.
+    #
+    # This does not replace or weaken the combined run: both stay required.
+    name: License Compliance (dependency licences)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install cargo-deny (pinned)
+        run: cargo install --locked --version 0.20.2 cargo-deny
+
+      # Canary: prove the licence gate can reject something before trusting a
+      # green result. A tree checked against an empty allow-list must fail; if
+      # it passes, the gate is not evaluating licences at all.
+      - name: Gate canary (an empty allow-list must fail)
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/lic-canary
+          printf '[licenses]\nallow = []\nconfidence-threshold = 0.8\n' > /tmp/lic-canary/deny.toml
+          if cargo deny --manifest-path ./Cargo.toml \
+               --config /tmp/lic-canary/deny.toml check licenses >/dev/null 2>&1; then
+            echo "FAIL: an empty allow-list was accepted - the licence gate is vacuous." >&2
+            exit 1
+          fi
+          echo "Canary rejected as expected; the gate evaluates licences."
+
+      - name: cargo deny check licenses
+        run: |
+          set -euo pipefail
+          cargo deny --all-features --manifest-path ./Cargo.toml \
+            --config .quality/deny.toml check licenses
+
+      # Inventory for the audit trail: what each dependency is licensed under,
+      # not merely whether the run passed.
+      - name: Licence inventory (summary)
+        if: always()
+        run: |
+          {
+            echo "### Dependency licences - root"
+            echo ""
+            echo '```'
+            cargo deny --all-features --manifest-path ./Cargo.toml \
+              --config .quality/deny.toml list 2>/dev/null | cut -c1-200 || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  secret-scan:
+    # Secret scan over the FULL git history (fetch-depth: 0).
+    # We use the gitleaks OSS binary: the official GitHub Action asks organisation
+    # repos for GITLEAKS_LICENSE (an external registration); the binary runs the same engine
+    # without a licence. Version + sha256 are pinned. Moving to the official action
+    # can be considered once a licence key is obtained (the security output
+    # is byte-identical).
+    name: Secret Scan (gitleaks, full history)
+    runs-on: ubuntu-latest
+    # security-events: write is needed so gitleaks findings upload to the Security tab as
+    # SARIF; the workflow-wide setting is `contents: read`, the elevation is
+    # granted to this job only.
+    permissions:
+      contents: read
+      security-events: write
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Install gitleaks v8.30.1 (version + sha256 pinned)
+        run: |
+          set -euo pipefail
+          curl -sSfL -o /tmp/gitleaks.tar.gz \
+            https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz
+          echo "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb  /tmp/gitleaks.tar.gz" | sha256sum -c -
+          sudo tar -xzf /tmp/gitleaks.tar.gz -C /usr/local/bin gitleaks
+          gitleaks version
+      - name: Canary - proof the gitleaks alarm fires
+        run: |
+          set -euo pipefail
+          # NOTE: the fake token is never written to this file as one piece;
+          # the parts are joined at runtime. Otherwise the repo's
+          # own history scan would take this pattern for a leak and FAIL.
+          PFX="gh""p_"
+          S1="xK9mQ2vR7pL4nT8w"
+          S2="Y3zB6cF1hJ5sD0gE42uI"
+          mkdir -p /tmp/gitleaks-canary
+          cd /tmp/gitleaks-canary
+          git init -q .
+          printf 'example_key = "%s%s%s"\n' "$PFX" "$S1" "$S2" > canary.txt
+          git add .
+          git -c user.email=ci@budlum.xyz -c user.name=ci commit -qm canary
+          if gitleaks detect --source . --redact --no-banner; then
+            echo "ERROR: gitleaks did not catch the canary -> the scan is untrustworthy (vacuous gate)!"
+            exit 1
+          fi
+          echo "Canary caught -> the gitleaks alarm works."
+      # Two steps: first generate SARIF (--exit-code 0 -> the step does not fall
+      # even with findings), then upload to the Security tab, and run the gate last.
+      # If one step is asked for both a report and a fail, the step dies right there when a
+      # finding appears and nothing reaches the Security tab.
+      - name: Full history scan - generate SARIF (reporting, not a gate)
+        run: |
+          gitleaks detect --source . --config .gitleaks.toml --redact \
+            --report-format sarif --report-path gitleaks.sarif --exit-code 0
+      - name: Upload gitleaks SARIF (Security tab)
+        if: always()
+        uses: github/codeql-action/upload-sarif@db488ddef3bf6cb639b32c2e9a7c0a7ea8271d28 # v4.37.8
+        with:
+          sarif_file: gitleaks.sarif
+          category: gitleaks
+      - name: Full history scan (a finding = fail)
+        run: gitleaks detect --source . --config .gitleaks.toml --redact --verbose

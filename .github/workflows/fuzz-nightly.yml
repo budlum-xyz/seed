@@ -1,0 +1,88 @@
+name: Fuzz Nightly
+
+# Long fuzz runs. Every night at 03:17 UTC each target is fuzzed for 4 hours;
+# each target runs in its own matrix job (the GitHub job ceiling is 6 hours, so
+# 5x4h in a single job is impossible and the matrix is mandatory).
+# The corpus is cached on every run and restored on the next (a growing corpus =
+# deepening coverage). If a crash is found it is uploaded as an artifact and the
+# job FAILS.
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: fuzz-nightly-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+permissions:
+  contents: read
+
+jobs:
+  fuzz-deep:
+    name: Fuzz Deep - ${{ matrix.target }} (4h)
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - payload_unpack
+          - drop_parse
+          - frame_unpack
+          - video_decode
+# this one runs the bytecode produced by the compiler on the VM: an accepted
+# program can spin up to the gas limit, so it belongs to the four-hour
+# schedule rather than the 60-second fast budget.
+          - budl_compile_then_run
+          # Neither of these two was listed here or in ci.yml. A comment in ci.yml
+# described them as "nightly/manual" and this matrix did not include them, so
+# they never ran. The surface they inspect is not small either: both take input
+# from an untrusted relayer, and the RLP decoder and the MPT proof verifier are
+# the part of the bridge fed from outside.
+          #
+          - evm_rlp_decode
+          - evm_mpt_verify
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust (nightly - cargo-fuzz requirement)
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master 2026-07-16
+        with:
+          toolchain: nightly
+      - name: Override the rust-toolchain.toml pin (nightly is required)
+        run: rustup override set nightly
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: fuzz
+          shared-key: fuzz
+      - name: Install cargo-fuzz
+        run: cargo install --locked cargo-fuzz
+      - name: Corpus cache (per target, rolling)
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            fuzz/corpus/${{ matrix.target }}
+            fuzz/artifacts/${{ matrix.target }}
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
+          restore-keys: |
+            fuzz-corpus-${{ matrix.target }}-
+      - name: Fuzz 4 hours - ${{ matrix.target }}
+        # cargo-fuzz runs from the repository root (see the fuzz-quick note in ci.yml).
+        run: |
+          set -euo pipefail
+          cargo fuzz run "${{ matrix.target }}" -- \
+            -max_total_time=14400 \
+            -timeout=25 \
+            -print_final_stats=1
+      - name: Crash artifact (if any)
+        if: failure()
+        continue-on-error: true
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: fuzz-nightly-${{ matrix.target }}-${{ github.run_id }}
+          path: fuzz/artifacts/${{ matrix.target }}/
+          if-no-files-found: ignore
+          retention-days: 30

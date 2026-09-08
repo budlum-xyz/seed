@@ -1,0 +1,115 @@
+name: Supply Chain Extra (udeps + geiger)
+
+on:
+  push:
+    branches: [ main ]
+  # Both jobs here are required checks on main. A required check that never
+  # runs on a pull request leaves every PR permanently "expected" and
+  # unmergeable, so this has to fire on PRs too.
+  pull_request:
+    branches: [ main ]
+  schedule:
+    # Weekly hygiene scan (effects of cargo update + new deps)
+    - cron: '17 4 * * 1'
+  workflow_dispatch:
+
+# Read-only.
+concurrency:
+  group: supply-chain-extra-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+permissions:
+  contents: read
+
+jobs:
+  udeps:
+    name: "Udeps: the unused dependency gate"
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # udeps requires nightly (rustc private API); install + run on the same nightly.
+      - name: Install Rust (nightly)
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master 2026-07-16
+        with:
+          toolchain: nightly
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: seed-core
+      - name: Install cargo-udeps (locked; the crates.io version is evidenced in the log)
+        run: cargo +nightly install cargo-udeps --locked
+      # `|| true` used to swallow the tool's exit status entirely in the past,
+      # so a cargo-udeps that died at startup produced an empty report and the
+      # gate read it as clean. The status is captured instead of discarded: a
+      # non-zero exit is tolerated only when the tool still emitted a
+      # parseable report (udeps exits non-zero *because* it found unused
+      # dependencies, which is a finding, not a failure).
+      - name: "Measurement + gate (any finding = FAIL)"
+        run: |
+          set -euo pipefail
+          set +e
+          cargo +nightly udeps --all-targets > /tmp/udeps.txt 2>&1
+          status=$?
+          set -e
+          cat /tmp/udeps.txt
+          if [ "$status" -eq 0 ]; then
+            echo "OK: no unused dependencies."
+            exit 0
+          fi
+          if grep -q '^unused dependencies:' /tmp/udeps.txt; then
+            echo "FAIL: unused dependencies found; remove them before merging." >&2
+            exit 1
+          fi
+          echo "cargo-udeps died with $status without producing a parsable report." >&2
+          exit "$status"
+
+  geiger:
+    name: "Geiger: unsafe visibility (the first-party 0 evidence layer)"
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master 2026-07-16
+        with:
+          toolchain: "1.97.1"
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: seed-core
+      - name: Install cargo-geiger (locked; the crates.io version is evidenced in the log)
+        run: cargo install cargo-geiger --locked
+      # Even when the scan completes successfully, cargo-geiger prints
+      # "error: Found N warnings" and returns non-zero when it finds `unsafe`
+      # in dependencies. Third-party `unsafe` is not this gate's subject (the
+      # first-party crate carries `#![forbid(unsafe_code)]`), so that exit
+      # code is not a scan failure. The distinction comes from the report:
+      # if the report contains the first-party line the scan completed.
+      - name: Measurement + the first-party gate (seed-core)
+        run: |
+          set -euo pipefail
+          set +e
+          cargo geiger --all-targets > /tmp/geiger.txt 2>&1
+          status=$?
+          set -e
+          cat /tmp/geiger.txt
+          if ! grep -qE 'seed-core [0-9]' /tmp/geiger.txt; then
+            echo "cargo-geiger died with $status without completing the scan:" >&2
+            echo "there is no first-party line in the report." >&2
+            exit "${status:-1}"
+          fi
+          # The seed-core line carries numeric columns; every one of them must
+          # be zero. forbid(unsafe_code) makes any other value a regression.
+          line=$(grep -E 'seed-core [0-9]' /tmp/geiger.txt | head -1)
+          echo "first-party line: $line"
+          nums=$(echo "$line" | grep -oE '[0-9]+' || true)
+          for n in $nums; do
+            if [ "$n" -ne 0 ]; then
+              echo "FAIL: first-party unsafe surfaced in seed-core." >&2
+              exit 1
+            fi
+          done
+          echo "OK: first-party unsafe count is 0."

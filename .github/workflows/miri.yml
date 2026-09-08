@@ -1,0 +1,152 @@
+name: Miri UB Check
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  # A weekly nightly run, continuous UB inspection
+  schedule:
+    - cron: '0 3 * * 1'  # Monday 03:00 UTC
+
+concurrency:
+  group: miri-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+permissions:
+  contents: read
+
+jobs:
+  miri-lib:
+    # CI Expansion item 4: Miri undefined behavior inspection.
+    # It looks for UB across the seed transfer library: the parser surfaces
+    # (payload, carousel, frame, video) are where untrusted bytes enter.
+    #
+    # Hardening (2026-07-21): nightly is DATE-PINNED (nightly-2026-07-19).
+    # Previously "nightly" was a floating tag, so when the Miri revision changed the
+    # CI result of the same commit could change (external-red risk + reproduction
+    # weakness). Removing or updating the pin is only done with a justification in
+    # the commit message (the same spirit as the MSRV pin discipline).
+    # Note: src/ carries a clean 0-unsafe base under `#![forbid(unsafe_code)]`;
+    # this gate is an early warning for UB surfacing through the dependency
+    # chain and for MIR-level errors.
+    name: Miri UB Inspection (library, nightly-2026-07-19) (item 4)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install pinned nightly Rust with Miri
+        run: |
+          rustup toolchain install nightly-2026-07-19 --component miri
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: seed-core
+          cache-on-failure: true
+      - name: Miri - library
+        run: |
+          set -euo pipefail
+          echo "Running Miri over the seed transfer library..."
+          cargo +nightly-2026-07-19 miri test --lib 2>&1 | tee /tmp/miri-lib.txt
+          echo "Miri lib: $(grep -c 'test result: ok' /tmp/miri-lib.txt || echo '0') suites passed"
+        env:
+          MIRIFLAGS: "-Zmiri-disable-isolation"
+
+  asan:
+    # An alternative to cargo-careful. With the pinned nightly the 0.4.7 tool
+# cannot build a sysroot (std moved `panic_unwind` behind `dep:` while the tool
+    # as a feature). Moving nightly to suit the tool would mean giving up the
+# still asks for it implicitly as a feature).
+    #
+    # So the tool was not taken, the work the tool does was. cargo-careful does two
+# things: it builds std with debug_assertions and adds extra run-time checks.
+# Both can be obtained directly with flags:
+    #
+    #   -Zbuild-std                build std from source
+    #   -Zsanitizer=address        catch memory errors at run time
+    #   -Cdebug-assertions=on      re-enable the assertions std turns off for
+    #                              performance
+    #
+    # Let the coverage difference be honest: cargo-careful additionally enables some
+    # rustc checks, while ASan sees memory errors it does not. The two are not
+    # identical, but the gap covers most of what would otherwise stay uncovered in
+    # the tool's absence: what Miri
+# cannot execute: paths containing FFI and system calls.
+    #
+    # BLOCKS. It has a canary.
+    name: AddressSanitizer + debug std (in place of careful)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust (nightly, date-pinned)
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master 2026-07-16
+        with:
+          toolchain: nightly-2026-07-19
+          components: rust-src
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: asan
+      # Canary: a program that deliberately accesses freed memory is written and
+      # ASan is expected to catch it. If it does not, the tool is not working.
+      # means the tool is not working and a clean run means nothing. The same thing
+      # was missing for years in the TSan job: "no error" could not be told apart
+      # from "the binary never ran".
+      - name: ASan canary (does the tool really catch it)
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/asan-canary/src
+          cat > /tmp/asan-canary/Cargo.toml <<'EOF'
+          [package]
+          name = "asan-canary"
+          version = "0.0.0"
+          edition = "2021"
+          EOF
+          cat > /tmp/asan-canary/src/main.rs <<'EOF'
+          // Access to freed memory. If ASan does not see this the scan is
+          // not trustworthy.
+          fn main() {
+              let p = {
+                  let v = vec![1u8, 2, 3, 4];
+                  v.as_ptr()
+              };
+              let x = unsafe { *p };
+              println!("{x}");
+          }
+          EOF
+          cd /tmp/asan-canary
+          export RUSTFLAGS="-Zsanitizer=address"
+          # Capture the output into a file FIRST, search SECOND.
+          #
+          # The first version was `cargo run ... | tee log | grep -q ...` and it
+          # did not work under `set -euo pipefail`: when the program
+          # exited non-zero pipefail killed the pipeline there, grep never ran, and
+          # the canary said "it could not catch it". ASan actually
+          # had caught it; the shadow byte dump was right there in the log. So the canary
+          # was measuring its own shell logic rather than the tool.
+          #
+          # `|| true` is deliberate: this command is EXPECTED TO FAIL, because it
+          # runs an intentional memory error. The decision is made by the grep below.
+          # and that one blocks.
+          cargo +nightly-2026-07-19 run -Zbuild-std \
+            --target x86_64-unknown-linux-gnu > /tmp/asan-canary.log 2>&1 || true
+          if grep -qiE "AddressSanitizer|use-after-free|stack-use-after-scope" \
+               /tmp/asan-canary.log; then
+            echo "canary OK: ASan caught the deliberately written memory error."
+          else
+            echo "CANARY FAILED: ASan could not catch a memory error, so even a clean run" >&2
+            echo "of this job proves nothing." >&2
+            tail -25 /tmp/asan-canary.log >&2
+            exit 1
+          fi
+
+      - name: ASan + debug std (lib testleri)
+        run: |
+          set -euo pipefail
+          export RUSTFLAGS="-Zsanitizer=address -Cdebug-assertions=on"
+          export ASAN_OPTIONS="detect_leaks=0"
+          cargo +nightly-2026-07-19 test --lib -Zbuild-std \
+            --target x86_64-unknown-linux-gnu -- --test-threads=1

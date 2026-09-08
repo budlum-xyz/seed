@@ -1,0 +1,75 @@
+# (supply-chain): weekly dependency oversight.
+# github-actions: opens updates for SHA-pinned actions as PRs.
+# cargo: the root + fuzz manifests. npm: the web/ interface.
+#
+# Grouping: minor+patch cargo updates are collected into a single PR, which
+# reduces the PR backlog. Major updates stay as separate PRs (they need
+# careful review).
+# Cooldown (zizmor: dependabot-cooldown): 7 days minimum, a supply-chain
+# mitigation.
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "06:00"
+      timezone: "Europe/Istanbul"
+    open-pull-requests-limit: 5
+    cooldown:
+      default-days: 7
+    groups:
+      actions-minor-patch:
+        update-types: ["minor", "patch"]
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "06:00"
+      timezone: "Europe/Istanbul"
+    open-pull-requests-limit: 5
+    cooldown:
+      default-days: 7
+    groups:
+      # Collect minor+patch Rust deps into one PR; major stays separate.
+      rust-minor-patch:
+        update-types: ["minor", "patch"]
+    ignore:
+      # qrcode and rqrr are pinned to their current majors on purpose, not by
+      # neglect. Their byte-mode QR symbols and their decoded bytes ARE the
+      # optical wire format of the seed transfer: a major bump that changes a
+      # single encoded byte would make old and new builds disagree on what a
+      # frame contains. Revisit only together with a coordinated wire-format
+      # migration and re-pinned golden vectors.
+      - dependency-name: "qrcode"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "rqrr"
+        update-types: ["version-update:semver-major"]
+  - package-ecosystem: "cargo"
+    directory: "/fuzz"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "06:00"
+      timezone: "Europe/Istanbul"
+    open-pull-requests-limit: 3
+    cooldown:
+      default-days: 7
+    groups:
+      rust-minor-patch:
+        update-types: ["minor", "patch"]
+  - package-ecosystem: "npm"
+    directory: "/web"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "06:00"
+      timezone: "Europe/Istanbul"
+    open-pull-requests-limit: 5
+    cooldown:
+      default-days: 7
+    groups:
+      web-minor-patch:
+        update-types: ["minor", "patch"]

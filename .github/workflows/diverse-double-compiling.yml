@@ -1,0 +1,152 @@
+name: Diverse Double Compiling
+
+# You cannot say a binary came from its own source by trusting the compiler.
+#
+#
+# `determinism.yml` already verifies that compiling twice yields the same
+# pipeline digest. That says the **output is deterministic** and it is valuable; but if the
+# same compiler runs twice and that compiler adds something absent from the
+# source, both runs produce the same surplus and the comparison passes.
+# A self-reproducing compiler backdoor is invisible in exactly this way.
+#
+# The observation is this: the problem is not trust but **the absence of
+# independent verification**. The same source is built with two different
+# compilers; if both produce the same bytes, both must have added the same
+# surplus independently. This job sets that up.
+#
+# DELIBERATE-TOOLCHAIN-DIVERGENCE
+#
+# This job deliberately diverges from the pin in `rust-toolchain.toml`; the
+# `docker-toolchain` gate sees this marker and does not inspect this file. Divergence is the point
+# of the job: building the same source with a second compiler. Matching the pin
+# would mean running the same compiler twice, and `determinism.yml` already does that.
+#
+# What is compared is not the binary but **the canonical summary of the binary's
+# behaviour**. Rust binaries are not bit-for-bit reproducible today: path
+# prefixes, incremental build metadata and absolute paths in panic messages
+# produce different bytes across two runs. Those differences do not change
+# behaviour, and comparing them would make the job always red, measuring nothing.
+# Instead the values the pipeline commits to are compared: the recipe digest,
+# the stream commitment and the carrier dimensions. Those are exactly the
+# places a backdoor could hide.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # Once a week: two full builds are expensive, and backdoor classes do not
+    # change on every commit.
+    - cron: "0 4 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ddc-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  compile-with:
+    name: Stage 1 (${{ matrix.label }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The canonical compiler: the version the repository pins.
+          - label: pinned
+            toolchain: "1.97.1"
+          # The independent compiler: the current stable channel, hence a
+          # different version, a different binary and a different build
+          # history. For it to carry the same backdoor, both would have to
+          # have been compromised in the same way.
+          - label: independent
+            toolchain: stable
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust ${{ matrix.toolchain }}
+        run: |
+          set -euo pipefail
+          rustup toolchain install "${{ matrix.toolchain }}" --profile minimal
+          rustup default "${{ matrix.toolchain }}"
+          rustc --version
+
+
+      - name: Build
+        run: cargo build --release 2>&1 | tail -5
+
+      - name: Canonical digests
+        id: digests
+        run: |
+          set -euo pipefail
+          # The full suite must pass under this compiler first: a compiler
+          # that changes behaviour will be caught here, not only in the diff.
+          cargo test --release --locked --lib 2>&1 | tail -3
+          # Pipeline commitments: the values a receiver depends on. If
+          # something absent from the source gets into the build, the two
+          # compilers diverge on them.
+          # No `|| true`. If the gate does not run this job goes red: something
+          # unmeasurable cannot be counted green, and a silently skipped stage empties
+          # the comparison.
+          cargo run --release --example demo > /tmp/demo.txt
+          RECIPE=$(grep 'recipe digest' /tmp/demo.txt | tail -1 | awk '{print $NF}')
+          COMMIT=$(grep 'stream commit' /tmp/demo.txt | tail -1 | awk '{print $NF}')
+          FRAMES=$(grep 'frame count' /tmp/demo.txt | tail -1 | awk '{print $NF}')
+          VSIZE=$(grep 'video size' /tmp/demo.txt | tail -1 | awk '{print $NF}')
+          test -n "${RECIPE}"
+          test -n "${COMMIT}"
+          test -n "${FRAMES}"
+          test -n "${VSIZE}"
+          {
+            echo "recipe=${RECIPE}"
+            echo "commit=${COMMIT}"
+            echo "frames=${FRAMES}"
+            echo "video_size=${VSIZE}"
+          } >> "$GITHUB_OUTPUT"
+          printf 'recipe=%s\ncommit=%s\nframes=%s\nvideo_size=%s\n' "${RECIPE}" "${COMMIT}" "${FRAMES}" "${VSIZE}" > "digests-${{ matrix.label }}.txt"
+          cat "digests-${{ matrix.label }}.txt"
+
+      - name: Upload digests
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: ddc-digests-${{ matrix.label }}
+          path: digests-${{ matrix.label }}.txt
+          retention-days: 7
+
+  compare:
+    name: Stage 2 compare (bit-for-bit on canonical values)
+    runs-on: ubuntu-latest
+    needs: compile-with
+    timeout-minutes: 10
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          pattern: ddc-digests-*
+          merge-multiple: true
+
+      - name: Compare
+        run: |
+          set -euo pipefail
+          test -f digests-pinned.txt
+          test -f digests-independent.txt
+          echo "--- pinned"
+          cat digests-pinned.txt
+          echo "--- independent"
+          cat digests-independent.txt
+
+          # A value that cannot be used is not compared and **not silently
+          # passed**: something unmeasurable cannot be counted green.
+          if ! diff -u digests-pinned.txt digests-independent.txt; then
+            echo "FAIL: two independent compilers produced different canonical values"
+            echo "from the same source. Either the build picked up something"
+            echo "process-dependent, or one added something absent from the source. Both are investigated."
+            exit 1
+          fi
+          echo "OK: two independent compilers produced the same canonical values."

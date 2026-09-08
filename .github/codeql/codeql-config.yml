@@ -1,0 +1,29 @@
+name: "Seed CodeQL config"
+disable-default-queries: false
+
+queries:
+  - uses: security-extended
+  - uses: security-and-quality
+
+# Rule filters carry the same discipline as the core repository: a rule is
+# excluded only after being verified line by line as a structural false
+# positive, together with its justification. Everything else stays in scope
+# and a finding is an alert.
+query-filters:
+  # rust/hard-coded-cryptographic-value: array initializers such as
+  # `[0u8; 32]` are empty buffers filled immediately after, or protocol
+  # constants (zero sentinels, domain tags). They are not secret material.
+  # Real secret scanning is done by the gitleaks job (full history, with a
+  # canary) and by Semgrep p/secrets.
+  - exclude:
+      id: rust/hard-coded-cryptographic-value
+
+paths-ignore:
+  - "**/tests/**"
+  - "**/*.test.rs"
+  - fuzz/**
+  - examples/**
+  - supply-chain/**
+  - web/node_modules/**
+  - web/dist/**
+  - target/**

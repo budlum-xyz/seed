@@ -1,0 +1,42 @@
+[package]
+name = "seed-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.seed-core]
+path = ".."
+
+[[bin]]
+name = "payload_unpack"
+path = "fuzz_targets/payload_unpack.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "drop_parse"
+path = "fuzz_targets/drop_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "frame_unpack"
+path = "fuzz_targets/frame_unpack.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "video_decode"
+path = "fuzz_targets/video_decode.rs"
+test = false
+doc = false
+bench = false

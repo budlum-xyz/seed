@@ -1,0 +1,19 @@
+[package]
+name = "seed-core"
+version = "0.1.0"
+edition = "2021"
+# Required so the root cargo-deny `unlicensed = "deny"` rule does not refuse
+# the first-party crate: PolyForm Shield is not an SPDX id, the LicenseRef
+# form is the SPDX-correct way to name it.
+license = "LicenseRef-PolyForm-Shield-1.0.0"
+description = "Budlum 3.0 seed transfer core: content to recipe and back."
+repository = "https://github.com/budlum-xyz/seed"
+publish = false
+
+[dependencies]
+flate2 = "1"
+hex = "0.4"
+qrcode = { version = "0.14", default-features = false }
+rqrr = "0.5"
+serde = { version = "1", features = ["derive"] }
+sha2 = "0.10"
